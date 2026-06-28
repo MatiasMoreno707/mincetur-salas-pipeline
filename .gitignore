@@ -1,0 +1,23 @@
+# Entorno virtual
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Outputs generados (se regeneran al ejecutar el pipeline)
+output/
+
+# Variables de entorno
+.env
+*.env
+
+# IDEs
+.vscode/
+.idea/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

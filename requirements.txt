@@ -1,0 +1,7 @@
+playwright>=1.40.0
+pandas
+folium>=0.14.0
+geopy>=2.3.0
+openpyxl>=3.1.0
+geopandas>=0.14.0
+matplotlib>=3.5.0
