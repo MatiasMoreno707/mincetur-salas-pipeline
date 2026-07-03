@@ -10,6 +10,9 @@ __pycache__/
 # Outputs generados (se regeneran al ejecutar el pipeline)
 output/
 
+# Caché de OSMnx / Overpass
+cache/
+
 # Variables de entorno
 .env
 *.env

@@ -144,20 +144,47 @@ def _load_sensitive_sites() -> list[dict]:
     return sites
 
 
+def _build_exclusion_buffers(sites: list[dict], radius_m: float = 150.0):
+    """Calcula los radios de exclusión de la Ley 27153 con GeoPandas (buffer métrico).
+
+    Proyecta los puntos a un CRS métrico (UTM 18S), genera un buffer de `radius_m`
+    metros y los devuelve reproyectados a WGS84 como GeoDataFrame.
+    """
+    try:
+        import geopandas as gpd
+    except Exception:
+        return None
+    if not sites:
+        return None
+    df = pd.DataFrame(sites)
+    gdf = gpd.GeoDataFrame(
+        df.copy(),
+        geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
+        crs=4326,
+    ).to_crs(32718)
+    gdf["geometry"] = gdf.geometry.buffer(radius_m)
+    return gdf.to_crs(4326)
+
+
 def _add_sensitive_sites_layer(map_obj: folium.Map, sites: list[dict]) -> None:
     layer = folium.FeatureGroup(name="Lugares sensibles", show=False)
+
+    # Radios de exclusión de 150 m calculados con GeoPandas.
+    buffers = _build_exclusion_buffers(sites, radius_m=150.0)
+    if buffers is not None and not buffers.empty:
+        folium.GeoJson(
+            buffers.to_json(),
+            name="Radios de exclusión (150 m)",
+            style_function=lambda _f: {
+                "fillColor": "#1f77b4",
+                "color": "#1f77b4",
+                "weight": 2,
+                "fillOpacity": 0.15,
+            },
+        ).add_to(layer)
+
     for site in sites:
         popup_html = f"<b>{site.get('name')}</b><br>Tipo: {site.get('category')}"
-        folium.Circle(
-            location=[site["latitude"], site["longitude"]],
-            radius=150,
-            color="#1f77b4",
-            fill=True,
-            fill_color="#1f77b4",
-            fill_opacity=0.15,
-            weight=2,
-            popup=folium.Popup(popup_html, max_width=300),
-        ).add_to(layer)
         folium.Marker(
             location=[site["latitude"], site["longitude"]],
             popup=folium.Popup(popup_html, max_width=300),
@@ -311,7 +338,10 @@ def create_map(df: pd.DataFrame, full_df: pd.DataFrame | None = None, departamen
             icon=folium.Icon(color=icon_color, icon="info-sign")
         ).add_to(marker_cluster)
     
-    # Note: removed global HeatMap layer; map will include Clusters, Distritos Lima, Lugares sensibles and Departamentos
+    # Mapa de calor (HeatMap) de densidad competitiva sobre el área seleccionada.
+    heat_data = df_selected[["latitude", "longitude"]].dropna().values.tolist()
+    if heat_data:
+        HeatMap(heat_data, name="Densidad competitiva", radius=18, blur=15).add_to(map_obj)
 
     # Add department-level polygons aggregated by departamento for the rest of Peru (skip selected dept like LIMA)
     # For department-level aggregation (non-Lima), load departmental GeoJSON

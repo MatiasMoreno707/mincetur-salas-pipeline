@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
 
 INPUT_FILE_NAME = "mincetur_salas.csv"
 OUTPUT_FILE_NAME = "mincetur_salas_transformed.csv"
+EXCEPTIONS_FILE_NAME = "mincetur_salas_exceptions.csv"
+DISTRITAL_GEOJSON = "peru_distrital_simple.geojson"
+
+# Campos obligatorios para que un registro sea apto para geocodificación.
+OBLIGATORY_FIELDS = ["establecimiento", "direccion", "distrito"]
 
 
 def get_input_path() -> Path:
@@ -20,15 +27,77 @@ def get_output_path() -> Path:
     return workspace_root / "data" / "raw" / OUTPUT_FILE_NAME
 
 
+def get_exceptions_path() -> Path:
+    workspace_root = Path(__file__).resolve().parents[1]
+    return workspace_root / "data" / "raw" / EXCEPTIONS_FILE_NAME
+
+
 def _load_raw_csv(input_path: Path | None = None) -> pd.DataFrame:
     if input_path is None:
         input_path = get_input_path()
     return pd.read_csv(input_path, encoding="utf-8-sig")
 
 
+def _strip_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+# --------------------------------------------------------------------------
+# Estandarización de distritos con UBIGEO (INEI, desde GeoJSON distrital local)
+# --------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def _load_ubigeo_index() -> dict[str, tuple[str, str]]:
+    """Construye un índice {departamento|distrito -> (DISTRITO canónico, UBIGEO)}
+    a partir del shapefile distrital del INEI (peru_distrital_simple.geojson)."""
+    workspace_root = Path(__file__).resolve().parents[1]
+    geo_path = workspace_root / "data" / "raw" / "geo" / DISTRITAL_GEOJSON
+    if not geo_path.exists():
+        return {}
+
+    with geo_path.open("r", encoding="utf-8") as f:
+        geojson = json.load(f)
+
+    index: dict[str, tuple[str, str]] = {}
+    for feature in geojson.get("features", []):
+        props = feature.get("properties", {})
+        departamento = props.get("DEPARTAMEN", "")
+        distrito = props.get("DISTRITO", "")
+        ubigeo = str(props.get("UBIGEO", "") or "")
+        key = f"{_strip_accents(departamento).strip().upper()}|{_strip_accents(distrito).strip().upper()}"
+        if key and key not in index:
+            index[key] = (str(distrito).strip().upper(), ubigeo)
+    return index
+
+
+def _standardize_distritos(df: pd.DataFrame) -> pd.DataFrame:
+    """Estandariza el nombre del distrito al estándar INEI y añade la columna ubigeo."""
+    index = _load_ubigeo_index()
+    if not index or "distrito" not in df.columns or "departamento" not in df.columns:
+        df["ubigeo"] = pd.NA
+        return df
+
+    canonical: list[str] = []
+    ubigeos: list[object] = []
+    for _, row in df.iterrows():
+        dep = _strip_accents(row.get("departamento", "")).strip().upper()
+        dist = _strip_accents(row.get("distrito", "")).strip().upper()
+        match = index.get(f"{dep}|{dist}")
+        if match:
+            canonical.append(match[0])
+            ubigeos.append(match[1])
+        else:
+            canonical.append(str(row.get("distrito", "")).strip().upper())
+            ubigeos.append(pd.NA)
+
+    df["distrito"] = canonical
+    df["ubigeo"] = ubigeos
+    return df
+
+
 def _normalize_address(value: str, district: str | None = None) -> str:
     text = str(value or "").strip().upper()
-    text = re.sub(r"[\u2018\u2019\u201c\u201d]", "'", text)
+    text = re.sub(r"[‘’“”]", "'", text)
     text = re.sub(r"[^A-Z0-9ÁÉÍÓÚÑÜ\s\-\/,\.()&]", " ", text)
 
     expansions = {
@@ -104,12 +173,12 @@ def _apply_filters(df: pd.DataFrame, departamento: str | None = None, provincia:
         departamento = departamento.upper()
         df = df[df["departamento"].astype(str).str.upper() == departamento]
         print(f"✓ Filtro aplicado: Departamento = {departamento} ({len(df)} registros)")
-    
+
     if provincia:
         provincia = provincia.upper()
         df = df[df["provincia"].astype(str).str.upper() == provincia]
         print(f"✓ Filtro aplicado: Provincia = {provincia} ({len(df)} registros)")
-    
+
     return df
 
 
@@ -119,25 +188,61 @@ def _clean_text(value: str) -> str:
     return text
 
 
-def _normalize_business_text(value: str) -> str:
-    return _clean_text(value).upper()
+def _is_missing(value: object) -> bool:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return True
+    text = str(value).strip().lower()
+    return text in {"", "nan", "none", "--", "sin dato", "s/d"}
+
+
+def _validate_and_impute(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Valida campos obligatorios (nombre, dirección, distrito).
+
+    Aplica reglas de imputación simples; los registros que aún quedan incompletos
+    se descartan y se documentan en un log de excepciones con código validation_error.
+    Devuelve (df_aptos, df_excepciones).
+    """
+    df = df.copy()
+
+    # Regla de imputación: si falta el nombre del establecimiento, usar la empresa.
+    if "establecimiento" in df.columns and "empresa" in df.columns:
+        mask = df["establecimiento"].apply(_is_missing) & ~df["empresa"].apply(_is_missing)
+        df.loc[mask, "establecimiento"] = df.loc[mask, "empresa"]
+
+    def faltantes(row) -> list[str]:
+        return [c for c in OBLIGATORY_FIELDS if c not in df.columns or _is_missing(row.get(c))]
+
+    faltantes_por_fila = df.apply(faltantes, axis=1)
+    invalidos = faltantes_por_fila.apply(len) > 0
+
+    exceptions = df[invalidos].copy()
+    if not exceptions.empty:
+        exceptions["validation_error"] = faltantes_por_fila[invalidos].apply(
+            lambda cols: "campos_obligatorios_faltantes: " + ", ".join(cols)
+        )
+
+    aptos = df[~invalidos].copy()
+    print(f"✓ Validación: {len(aptos)} registros aptos, {len(exceptions)} descartados (validation_error)")
+    return aptos, exceptions
 
 
 def _deduplicate_salas(df: pd.DataFrame) -> pd.DataFrame:
-    if "empresa" not in df.columns or "establecimiento" not in df.columns:
+    """Deduplicación heurística con clave compuesta nombre + dirección + distrito.
+
+    Conserva el registro más reciente por clave (vigencia descendente).
+    """
+    required = {"establecimiento", "direccion", "distrito"}
+    if not required.issubset(df.columns):
         return df
 
     df = df.copy()
-    df["empresa_clean"] = df["empresa"].astype(str).apply(_normalize_business_text)
-    df["establecimiento_clean"] = df["establecimiento"].astype(str).apply(_normalize_business_text)
+    df["_nombre_key"] = df["establecimiento"].astype(str).str.strip().str.upper()
+    df["_dir_key"] = df["direccion"].astype(str).str.strip().str.upper()
+    df["_dist_key"] = df["distrito"].astype(str).str.strip().str.upper()
 
-    df = df.sort_values(
-        by=["empresa_clean", "establecimiento_clean", "vigencia"],
-        ascending=[True, True, False],
-        na_position="last",
-    )
-    df = df.drop_duplicates(subset=["empresa_clean", "establecimiento_clean"], keep="first")
-    df = df.drop(columns=["empresa_clean", "establecimiento_clean"])
+    df = df.sort_values(by=["vigencia"], ascending=[False], na_position="last")
+    df = df.drop_duplicates(subset=["_nombre_key", "_dir_key", "_dist_key"], keep="first")
+    df = df.drop(columns=["_nombre_key", "_dir_key", "_dist_key"])
     return df
 
 
@@ -172,12 +277,22 @@ def transform_salas(df: pd.DataFrame | None = None, input_path: Path | None = No
     df["establecimiento"] = df["establecimiento"].astype(str).apply(_clean_text)
     df["vigencia"] = pd.to_datetime(df["vigencia"], dayfirst=True, errors="coerce")
 
-    df = _deduplicate_salas(df)
-    df = _apply_filters(df, departamento, provincia)
-
     for numeric_col in ["maq", "memoria", "mesas"]:
         if numeric_col in df.columns:
             df[numeric_col] = pd.to_numeric(df[numeric_col].replace({"--": None}), errors="coerce")
+
+    # Estandarización de distritos con el estándar UBIGEO del INEI.
+    df = _standardize_distritos(df)
+
+    # Validación de campos obligatorios, imputación y log de excepciones.
+    df, exceptions = _validate_and_impute(df)
+    exc_path = get_exceptions_path()
+    exc_path.parent.mkdir(parents=True, exist_ok=True)
+    exceptions.to_csv(exc_path, index=False, encoding="utf-8-sig")
+
+    # Deduplicación heurística (nombre + dirección + distrito).
+    df = _deduplicate_salas(df)
+    df = _apply_filters(df, departamento, provincia)
 
     df["direccion_original"] = df["direccion"].astype(str).str.strip()
     df["direccion_normalizada"] = df.apply(

@@ -2,14 +2,26 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
-import math
-import urllib.parse
-import urllib.request
 
 import pandas as pd
 
 OUTPUT_FILE_NAME = "mincetur_salas_enriched.csv"
 POIS_FILE_NAME = "pois_ley27153.csv"
+
+# CRS métrico para Lima (UTM zona 18S) usado en los cálculos de distancia en metros.
+METRIC_CRS = 32718
+WGS84 = 4326
+RADIO_LEY_27153_M = 150.0
+
+# Categorías de lugares sensibles del Artículo 5 de la Ley N.° 27153 y sus etiquetas OSM.
+POI_TAGS = {
+    "amenity": [
+        "place_of_worship", "school", "kindergarten", "university", "college",
+        "hospital", "clinic", "police", "fire_station",
+    ],
+    "building": ["church"],
+    "military": ["barracks"],
+}
 
 
 def get_output_path() -> Path:
@@ -22,21 +34,100 @@ def get_pois_output_path() -> Path:
     return workspace_root / "data" / "raw" / POIS_FILE_NAME
 
 
-def _haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius = 6371000.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return radius * c
+def get_geo_dir() -> Path:
+    workspace_root = Path(__file__).resolve().parents[1]
+    return workspace_root / "data" / "raw" / "geo"
 
 
-def _ensure_numeric_lat_lon(df: pd.DataFrame) -> pd.DataFrame:
-    if "latitude" in df.columns and "longitude" in df.columns:
-        df = df.copy()
-        df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
-        df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
-    return df
+def _categorize(tags: dict) -> str:
+    amenity = tags.get("amenity")
+    if amenity == "place_of_worship" or tags.get("building") == "church":
+        return "Iglesia"
+    if amenity in {"school", "kindergarten", "university", "college"}:
+        return "Centro educativo"
+    if amenity in {"hospital", "clinic"}:
+        return "Centro hospitalario"
+    if amenity == "police":
+        return "Comisaría"
+    if amenity == "fire_station" or tags.get("military") == "barracks":
+        return "Cuartel"
+    return "Otro"
+
+
+def _fetch_sensitive_pois_osmnx(df: pd.DataFrame) -> pd.DataFrame:
+    """Descarga los POIs sensibles desde OpenStreetMap (Overpass) mediante OSMnx."""
+    import osmnx as ox
+    from shapely.geometry import box
+
+    df = df.copy()
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+    if df["latitude"].dropna().empty or df["longitude"].dropna().empty:
+        return pd.DataFrame(columns=["name", "category", "latitude", "longitude", "tags"])
+
+    south = float(df["latitude"].min()) - 0.05
+    north = float(df["latitude"].max()) + 0.05
+    west = float(df["longitude"].min()) - 0.05
+    east = float(df["longitude"].max()) + 0.05
+
+    area = box(west, south, east, north)
+    print("Descargando POIs sensibles con OSMnx (Overpass)...")
+    gdf = ox.features_from_polygon(area, tags=POI_TAGS)
+
+    if gdf.empty:
+        return pd.DataFrame(columns=["name", "category", "latitude", "longitude", "tags"])
+
+    # Usar el centroide (proyectado) para geometrías que no sean puntos.
+    geom = gdf.geometry
+    centroids = geom.to_crs(METRIC_CRS).centroid.to_crs(WGS84)
+
+    records = []
+    for (idx, row), pt in zip(gdf.iterrows(), centroids):
+        if pt is None or pt.is_empty:
+            continue
+        tags = {k: row[k] for k in ("amenity", "building", "military") if k in gdf.columns and pd.notna(row.get(k))}
+        name = row.get("name") if "name" in gdf.columns and pd.notna(row.get("name")) else "Lugar sensible"
+        records.append({
+            "name": name,
+            "category": _categorize(tags),
+            "latitude": pt.y,
+            "longitude": pt.x,
+            "tags": json.dumps(tags, ensure_ascii=False),
+        })
+
+    pois_df = pd.DataFrame(records)
+    _save_pois_layers(pois_df)
+    return pois_df
+
+
+def _save_pois_layers(pois_df: pd.DataFrame) -> None:
+    """Guarda el CSV combinado y una capa GeoJSON independiente por categoría."""
+    pois_path = get_pois_output_path()
+    pois_path.parent.mkdir(parents=True, exist_ok=True)
+    pois_df.to_csv(pois_path, index=False, encoding="utf-8-sig")
+
+    if pois_df.empty:
+        return
+
+    try:
+        import geopandas as gpd
+        gdf = gpd.GeoDataFrame(
+            pois_df.copy(),
+            geometry=gpd.points_from_xy(pois_df["longitude"], pois_df["latitude"]),
+            crs=WGS84,
+        )
+        geo_dir = get_geo_dir()
+        geo_dir.mkdir(parents=True, exist_ok=True)
+        for category, group in gdf.groupby("category"):
+            slug = (
+                str(category).lower()
+                .replace(" ", "_").replace("í", "i").replace("á", "a")
+                .replace("é", "e").replace("ó", "o").replace("ú", "u")
+            )
+            group.to_file(geo_dir / f"pois_{slug}.geojson", driver="GeoJSON")
+        print(f"✓ POIs guardados: {len(pois_df)} registros en {gdf['category'].nunique()} capas GeoJSON por categoría.")
+    except Exception as e:
+        print(f"⚠ No se pudieron escribir las capas GeoJSON por categoría: {e}")
 
 
 def _load_sensitive_pois() -> pd.DataFrame:
@@ -49,194 +140,75 @@ def _load_sensitive_pois() -> pd.DataFrame:
     return pd.DataFrame(columns=["name", "category", "latitude", "longitude", "tags"])
 
 
-def _save_sensitive_pois(pois: list[dict]) -> pd.DataFrame:
-    pois_df = pd.DataFrame(pois)
-    pois_path = get_pois_output_path()
-    pois_path.parent.mkdir(parents=True, exist_ok=True)
-    pois_df.to_csv(pois_path, index=False, encoding="utf-8-sig")
-    return pois_df
-
-
-def _element_to_poi(el: dict) -> dict | None:
-    tags = el.get("tags", {}) or {}
-    if el.get("type") == "node":
-        lat = el.get("lat")
-        lon = el.get("lon")
-    else:
-        center = el.get("center")
-        if not center:
-            return None
-        lat = center.get("lat")
-        lon = center.get("lon")
-    if lat is None or lon is None:
-        return None
-
-    name = tags.get("name") or tags.get("official_name") or tags.get("alt_name") or "Lugar sensible"
-    category = "Otro"
-    if tags.get("amenity") == "place_of_worship" or tags.get("building") == "church":
-        category = "Iglesia"
-    elif tags.get("amenity") in {"school", "kindergarten", "university", "college"}:
-        category = "Centro educativo"
-    elif tags.get("amenity") in {"hospital", "clinic"}:
-        category = "Centro hospitalario"
-    elif tags.get("amenity") == "police":
-        category = "Comisaría"
-    elif tags.get("amenity") == "fire_station" or tags.get("military") == "barracks":
-        category = "Cuartel"
-
-    return {
-        "name": name,
-        "category": category,
-        "latitude": float(lat),
-        "longitude": float(lon),
-        "tags": json.dumps(tags, ensure_ascii=False),
-    }
-
-
-def _build_overpass_query(south: float, west: float, north: float, east: float) -> str:
-    filters = [
-        '["amenity"="place_of_worship"]',
-        '["building"="church"]',
-        '["amenity"="school"]',
-        '["amenity"="kindergarten"]',
-        '["amenity"="university"]',
-        '["amenity"="college"]',
-        '["amenity"="hospital"]',
-        '["amenity"="clinic"]',
-        '["amenity"="police"]',
-        '["amenity"="fire_station"]',
-        '["military"="barracks"]',
-    ]
-    blocks = []
-    for f in filters:
-        blocks.extend([
-            f"node{f}({south},{west},{north},{east});",
-            f"way{f}({south},{west},{north},{east});",
-            f"relation{f}({south},{west},{north},{east});",
-        ])
-    query = "\n".join(blocks)
-    return f"[out:json][timeout:120];\n(\n{query}\n);\nout center qt;"
-
-
-def _query_overpass(south: float, west: float, north: float, east: float) -> list[dict]:
-    query = _build_overpass_query(south, west, north, east)
-    url = "https://overpass-api.de/api/interpreter"
-    data = urllib.parse.urlencode({"data": query}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"User-Agent": "expansion-tool/1.0"})
-    with urllib.request.urlopen(req, timeout=180) as response:
-        response_data = response.read().decode("utf-8")
-    result = json.loads(response_data)
-    pois = []
-    for element in result.get("elements", []):
-        poi = _element_to_poi(element)
-        if poi is not None:
-            pois.append(poi)
-    return pois
-
-
-def _fetch_sensitive_pois_from_overpass(df: pd.DataFrame) -> pd.DataFrame:
-    df = _ensure_numeric_lat_lon(df)
-    if df["latitude"].dropna().empty or df["longitude"].dropna().empty:
-        return pd.DataFrame(columns=["name", "category", "latitude", "longitude", "tags"])
-    south = float(df["latitude"].min()) - 0.05
-    north = float(df["latitude"].max()) + 0.05
-    west = float(df["longitude"].min()) - 0.05
-    east = float(df["longitude"].max()) + 0.05
-    pois = _query_overpass(south, west, north, east)
-    return _save_sensitive_pois(pois)
-
-
-def _ensure_pois(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_pois(df: pd.DataFrame, mode: str = "csv") -> pd.DataFrame:
+    mode = (mode or "csv").lower()
+    if mode in ("new", "overpass", "osmnx"):
+        return _fetch_sensitive_pois_osmnx(df)
+    # modo csv: usar el CSV existente; si no hay, descargar como respaldo.
     pois_df = _load_sensitive_pois()
     if not pois_df.empty:
         return pois_df
-    return _fetch_sensitive_pois_from_overpass(df)
+    return _fetch_sensitive_pois_osmnx(df)
 
 
 def _compute_compliance(df: pd.DataFrame, pois_df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula el cumplimiento de la Ley 27153 usando GeoPandas en un CRS métrico.
+
+    Para cada establecimiento determina la distancia (en metros) al lugar sensible
+    más cercano, cuántos hay dentro de 150 m y si cumple (distancia > 150 m).
+    """
+    import geopandas as gpd
+
     df = df.copy()
-    df = _ensure_numeric_lat_lon(df)
-    if pois_df.empty or df.empty:
-        df["closest_sensitive_distance_m"] = pd.NA
-        df["closest_sensitive_name"] = pd.NA
-        df["closest_sensitive_category"] = pd.NA
-        df["sensitive_sites_within_150m"] = 0
-        df["complies_ley_27153"] = pd.NA
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+
+    cols_default = {
+        "closest_sensitive_distance_m": pd.NA,
+        "closest_sensitive_name": pd.NA,
+        "closest_sensitive_category": pd.NA,
+        "sensitive_sites_within_150m": 0,
+        "complies_ley_27153": pd.NA,
+    }
+
+    valid_pois = pois_df.dropna(subset=["latitude", "longitude"]) if not pois_df.empty else pois_df
+    if valid_pois.empty or df.dropna(subset=["latitude", "longitude"]).empty:
+        for col, val in cols_default.items():
+            df[col] = val
         return df
 
-    pois = [
-        {
-            "name": row["name"],
-            "category": row["category"],
-            "latitude": float(row["latitude"]),
-            "longitude": float(row["longitude"]),
-        }
-        for _, row in pois_df.iterrows()
-        if pd.notna(row["latitude"]) and pd.notna(row["longitude"])
-    ]
+    pois_gdf = gpd.GeoDataFrame(
+        valid_pois.copy(),
+        geometry=gpd.points_from_xy(valid_pois["longitude"], valid_pois["latitude"]),
+        crs=WGS84,
+    ).to_crs(METRIC_CRS)
 
-    distances = []
-    nearest_names = []
-    nearest_categories = []
-    counts = []
-    complies = []
-
+    distances, names, categories, counts, complies = [], [], [], [], []
     for _, row in df.iterrows():
-        lat = row.get("latitude")
-        lon = row.get("longitude")
-        if pd.isna(lat) or pd.isna(lon):
-            distances.append(pd.NA)
-            nearest_names.append(pd.NA)
-            nearest_categories.append(pd.NA)
-            counts.append(0)
-            complies.append(pd.NA)
+        if pd.isna(row["latitude"]) or pd.isna(row["longitude"]):
+            distances.append(pd.NA); names.append(pd.NA); categories.append(pd.NA)
+            counts.append(0); complies.append(pd.NA)
             continue
 
-        row_lat = float(lat)
-        row_lon = float(lon)
-        best_distance = None
-        best_site = None
-        count = 0
-        for site in pois:
-            distance = _haversine_distance(row_lat, row_lon, site["latitude"], site["longitude"])
-            if distance <= 150:
-                count += 1
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_site = site
+        punto = gpd.GeoSeries(
+            gpd.points_from_xy([row["longitude"]], [row["latitude"]]), crs=WGS84
+        ).to_crs(METRIC_CRS).iloc[0]
 
-        if best_site is None:
-            distances.append(pd.NA)
-            nearest_names.append(pd.NA)
-            nearest_categories.append(pd.NA)
-            counts.append(0)
-            complies.append(pd.NA)
-        else:
-            distances.append(round(best_distance, 2))
-            nearest_names.append(best_site["name"])
-            nearest_categories.append(best_site["category"])
-            counts.append(count)
-            complies.append(best_distance > 150)
+        dist = pois_gdf.geometry.distance(punto)
+        idx_min = dist.idxmin()
+        best = float(dist.loc[idx_min])
+        distances.append(round(best, 2))
+        names.append(pois_gdf.loc[idx_min, "name"])
+        categories.append(pois_gdf.loc[idx_min, "category"])
+        counts.append(int((dist <= RADIO_LEY_27153_M).sum()))
+        complies.append(best > RADIO_LEY_27153_M)
 
     df["closest_sensitive_distance_m"] = distances
-    df["closest_sensitive_name"] = nearest_names
-    df["closest_sensitive_category"] = nearest_categories
+    df["closest_sensitive_name"] = names
+    df["closest_sensitive_category"] = categories
     df["sensitive_sites_within_150m"] = counts
     df["complies_ley_27153"] = complies
     return df
-
-
-def _ensure_pois(df: pd.DataFrame, mode: str = "csv") -> pd.DataFrame:
-    mode = (mode or "csv").lower()
-    if mode == "csv":
-        pois_df = _load_sensitive_pois()
-        if not pois_df.empty:
-            return pois_df
-        return _fetch_sensitive_pois_from_overpass(df)
-    if mode in ("new", "overpass"):
-        return _fetch_sensitive_pois_from_overpass(df)
-    # fallback
-    return _load_sensitive_pois()
 
 
 def enrich_salas(df: pd.DataFrame, pois_mode: str = "csv") -> pd.DataFrame:
@@ -245,20 +217,15 @@ def enrich_salas(df: pd.DataFrame, pois_mode: str = "csv") -> pd.DataFrame:
     df["extraction_date"] = pd.Timestamp.now().floor("s")
     pois_df = _ensure_pois(df, mode=pois_mode)
     df = _compute_compliance(df, pois_df)
+
     output_path = get_output_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         df.to_csv(output_path, index=False, encoding="utf-8-sig")
-    except PermissionError as exc:
-        # Fallback: write to a timestamped file to avoid overwrite when file is locked
+    except PermissionError:
         import datetime
-
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fallback = output_path.with_name(output_path.stem + f"_{ts}" + output_path.suffix)
-        try:
-            df.to_csv(fallback, index=False, encoding="utf-8-sig")
-            print(f"Aviso: no se pudo sobrescribir {output_path}; se guardó en {fallback} en su lugar.")
-        except Exception as exc2:
-            print(f"Error al guardar CSV enriquecido: {exc2}")
-            raise
+        df.to_csv(fallback, index=False, encoding="utf-8-sig")
+        print(f"Aviso: no se pudo sobrescribir {output_path}; se guardó en {fallback}.")
     return df
